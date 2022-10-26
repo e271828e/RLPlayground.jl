@@ -3,6 +3,9 @@ uuid = "dfd74c55-8d2c-4e55-8dd1-669f5c9091e9"
 authors = ["Miguel Alonso <miguel883@gmail.com> and contributors"]
 version = "0.1.0"
 
+[deps]
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
 [compat]
 julia = "1.8"
 
