@@ -1,0 +1,13 @@
+name = "RL"
+uuid = "dfd74c55-8d2c-4e55-8dd1-669f5c9091e9"
+authors = ["Miguel Alonso <miguel883@gmail.com> and contributors"]
+version = "0.1.0"
+
+[compat]
+julia = "1.8"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
