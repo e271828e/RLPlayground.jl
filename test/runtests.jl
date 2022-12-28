@@ -1,6 +1,6 @@
-using RL
+using RLPlayground
 using Test
 
-@testset "RL.jl" begin
+@testset "RLPlayground.jl" begin
     # Write your tests here.
 end

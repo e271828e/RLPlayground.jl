@@ -157,14 +157,15 @@ mutable struct EpsGreedyPolicy{NS, NA} <: AbstractPolicy{NA}
     const q::SizedMatrix{NS, NA, Float64, 2, Matrix{Float64}}
     ε::Float64
     _weights::ProbabilityWeights{Float64, Float64, SizedVector{NA, Float64, Vector{Float64}}}
-    function EpsGreedyPolicy(NS::Integer, NA::Integer, ε::Float64 = 0.1)
-        q = zeros(NS, NA)
+    function EpsGreedyPolicy(q::AbstractMatrix{Float64}, ε::Float64 = 0.1)
+        (NS, NA) = size(q)
         _weights = ProbabilityWeights(SizedVector{NA}(fill(1/NA, NA)))
         new{NS, NA}(q, ε, _weights)
     end
 end
 
-EpsGreedyPolicy(::AbstractEnvironment{NS, NA}) where {NS, NA} = EpsGreedyPolicy(NS, NA)
+EpsGreedyPolicy(NS::Integer, NA::Integer, args...) = EpsGreedyPolicy(zeros(NS, NA), args...)
+EpsGreedyPolicy(::AbstractEnvironment{NS, NA}, args...) where {NS, NA} = EpsGreedyPolicy(NS, NA, args...)
 
 function action_probabilities(policy::EpsGreedyPolicy{NS, NA}, state::Integer) where {NS, NA}
     f = let best_action = findmax(view(policy.q, state, :))[2], ε = policy.ε
