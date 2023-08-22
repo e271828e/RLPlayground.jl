@@ -1,86 +1,94 @@
 # module Tabular
 
-#assumptions:
-#1) the agent has unrestricted information. its vision is not limited to a
-#   subtile, and it knows its absolute position within the environment.
-#   can be queried with env.agent_position, which is of course more efficient
-#   than findfirst(@view env.state[1, :, :]).
-#2) the agent has no notion of walls. it has no a priori knowledge of what
-#   happens when it tries to walk towards one.
-
 using UnPack, StatsBase, StaticArrays, Random
-using ReinforcementLearning.ReinforcementLearningBase
-using GridWorlds.SingleRoomUndirectedModule: SingleRoomUndirected
+using StaticArrays: sacollect
 
 import ReinforcementLearning.ReinforcementLearningBase as RLBase
-import ReinforcementLearning.ReinforcementLearningCore as RLCore
-import GridWorlds as GW
-
-# export IntegerState
-# export EpsGreedyPolicy, RandomPolicy
-
-export QTable, action_values, best_action, max_value
 
 ################################################################################
 ################################################################################
 
-################################# QTable #######################################
+############################## AbstractPolicy ##################################
 
-const QTable{NS, NA} = SizedMatrix{NS, NA, Float64, 2, Matrix{Float64}}
+abstract type AbstractPolicy end
 
-action_values(q::QTable, state::Integer) = view(q, state, :)
-best_action(q::QTable, state::Integer) = findmax(action_values(q, state))[2]
-max_value(q::QTable, state::Integer) = findmax(action_values(q, state))[1]
+#policy for discrete action spaces
+abstract type AbstractDiscretePolicy{NA} <: AbstractPolicy end
 
-################################ State Styles ##################################
-
-struct IntegerState <: RLBase.AbstractStateStyle end
-struct CartesianState <: RLBase.AbstractStateStyle end
+#returns the probability of each action in the given state
+get_probs(::AbstractDiscretePolicy, ::Any) = error("Not implemented")
+#returns the probability of the specified state-action pair
+get_prob(::AbstractDiscretePolicy, ::Any, ::Any) = error("Not implemented")
 
 ############################## RandomPolicy ####################################
 
 const Weights{NA} = ProbabilityWeights{Float64, Float64, SizedVector{NA, Float64, Vector{Float64}}}
 
-struct RandomPolicy{NA, R <: AbstractRNG} <: RLBase.AbstractPolicy
+struct RandomPolicy{NA} <: AbstractDiscretePolicy{NA}
     weights::Weights{NA}
-    rng::R
-    function RandomPolicy(weights::AbstractVector{<:AbstractFloat}, rng::R = Xoshiro()) where {R}
+    function RandomPolicy(weights::AbstractVector{<:AbstractFloat})
         NA = length(weights)
         @assert all(weights.>=0)
         Σweights = sum(weights)
         @assert Σweights > 0
         weights ./= Σweights
-        new{NA, R}(ProbabilityWeights(SizedVector{NA}(weights)), rng)
+        new{NA}(ProbabilityWeights(SizedVector{NA}(weights)))
     end
 end
 
 RandomPolicy(NA::Integer) = RandomPolicy(fill(1/NA, NA))
 RandomPolicy(env::RLBase.AbstractEnv) = RandomPolicy(RLBase.action_space(env) |> length)
 
-#values(weights) allocates
-RLBase.prob(policy::RandomPolicy, ::Integer) = policy.weights.values
-RLBase.prob(policy::RandomPolicy, state::Integer, action::Integer) = prob(policy, state)[action]
+get_probs(policy::RandomPolicy, ::Integer) = policy.weights.values #values(weights) allocates
+get_prob(policy::RandomPolicy, state::Integer, action::Integer) = get_probs(policy, state)[action]
 
-StatsBase.sample(policy::RandomPolicy, ::Integer) = sample(policy.rng, policy.weights)
-Random.seed!(policy::RandomPolicy, v::Integer) = seed!(policy.rng, v)
+StatsBase.sample(rng::AbstractRNG, policy::RandomPolicy, ::Integer) = sample(rng, policy.weights)
+StatsBase.sample(policy::RandomPolicy, args...) = sample(Random.GLOBAL_RNG, policy, args...)
 
-############################## EpsGreedyPolicy #################################
 
-mutable struct EpsGreedyPolicy{NS, NA, R <: AbstractRNG} <: RLBase.AbstractPolicy
-    const q::QTable{NS, NA}
+############################## ActionValue #####################################
+
+abstract type AbstractQ{NA} end
+
+struct TabularQ{NS, NA} <: AbstractQ{NA}
+    data::SizedMatrix{NS, NA, Float64, 2, Matrix{Float64}}
+end
+
+TabularQ(NS::Integer, NA::Integer) = TabularQ{NS, NA}(zeros(NS, NA))
+
+get_action_values(q::TabularQ, state::Integer) = view(q.data, state, :)
+get_max_value(q::TabularQ, state::Integer) = findmax(get_action_values(q, state))[1]
+
+#returns a boolean vector indicating all the (equally) best actions for a given
+#state. we use a SVector assuming NA is reasonably small
+function get_best_actions(q::TabularQ{NS, NA}, state::Integer)::SVector{NA, Bool} where {NS, NA}
+    q_row = SVector{NA}(get_action_values(q, state))
+    q_max = findmax(q_row)[1]
+    return q_row .== q_max
+end
+
+#returns a vector with the indices of the first best action for each state. we
+#use a SVector assuming NS is reasonably small
+function get_best_actions(q::TabularQ{NS, NA}) where {NS, NA}
+    sacollect(SVector{NS,Int}, findmax(get_best_actions(q, state))[2] for state in 1:NS)
+end
+
+# ############################## EpsGreedyPolicy #################################
+
+#NA: Number of (discrete) actions
+#Q: Action-value function
+mutable struct EpsGreedyPolicy{NA, Q <: AbstractQ{NA}} <: AbstractDiscretePolicy{NA}
+    const q::Q
     const _weights::Weights{NA}
-    const rng::R
     ε::Float64
-    function EpsGreedyPolicy(q_data::AbstractMatrix{<:AbstractFloat}, ε::Real = 0.1, rng::R = Xoshiro()) where {R}
+    function EpsGreedyPolicy(q::Q, ε::Real = 0.1) where {NA, Q <: AbstractQ{NA}}
         @assert 0 <= ε <= 1
-        (NS, NA) = size(q_data)
-        q = SizedMatrix{NS, NA, Float64}(q_data)
         _weights = ProbabilityWeights(SizedVector{NA}(fill(1/NA, NA)))
-        new{NS, NA, R}(q, _weights, rng, ε)
+        new{NA, Q}(q, _weights, ε)
     end
 end
 
-EpsGreedyPolicy(NS::Integer, NA::Integer, args...) = EpsGreedyPolicy(zeros(NS, NA), args...)
+EpsGreedyPolicy(NS::Integer, NA::Integer, args...) = EpsGreedyPolicy(TabularQ(NS, NA), args...)
 
 function EpsGreedyPolicy(env::RLBase.AbstractEnv, args...)
     NS = RLBase.state_space(env, IntegerState()) |> length
@@ -88,106 +96,347 @@ function EpsGreedyPolicy(env::RLBase.AbstractEnv, args...)
     EpsGreedyPolicy(NS, NA, args...)
 end
 
-function RLBase.prob(policy::EpsGreedyPolicy{NS, NA, R}, state::Integer) where {NS, NA, R}
-    f = let best_action = best_action(policy.q, state), ε = policy.ε
-        (action) -> (action == best_action ? 1-ε + ε/NA : ε/NA)
-    end
-    SVector{NA, Float64}(map(f, tuple(1:NA...))...)
+function set_ε!(policy::EpsGreedyPolicy, ε::Real)
+    @assert 0 <= ε <= 1
+    policy.ε = ε
+    return policy
 end
 
-function RLBase.prob(policy::EpsGreedyPolicy, state::Integer, action::Integer)
-    prob(policy, state)[action]
+function get_probs(policy::EpsGreedyPolicy{NA, Q}, state::Integer) where {NA, Q}
+    ε = policy.ε
+    best_actions = get_best_actions(policy.q, state)
+    n_best = count(best_actions)
+    p_best = 1/n_best * (1-ε + ε/NA)
+    p_others = ε/NA*(NA-1)/(NA-n_best)
+    sacollect(SVector{NA, Float64}, (best_actions[action] ? p_best : p_others) for action in 1:NA)
 end
 
-function StatsBase.sample(policy::EpsGreedyPolicy, state::Integer)
-    @unpack _weights, rng = policy
-    _weights.values .= RLBase.prob(policy, state) #avoids a new ProbabilityWeights, which allocates
+function get_prob(policy::EpsGreedyPolicy, state::Integer, action::Integer)
+    get_probs(policy, state)[action]
+end
+
+function StatsBase.sample(rng::AbstractRNG, policy::EpsGreedyPolicy, state::Integer)
+    @unpack _weights = policy
+    _weights.values .= get_probs(policy, state) #avoids a new ProbabilityWeights, which allocates
     _weights.sum = 1 #RLBase.prob(policy, state) sum to 1 by construction
     sample(rng, _weights)
 end
 
-Random.seed!(policy::EpsGreedyPolicy, v::Integer) = seed!(policy.rng, v)
+StatsBase.sample(policy::EpsGreedyPolicy, args...) = sample(Random.GLOBAL_RNG, policy, args...)
 
-############################### Environment ####################################
 
-#we don't want the default state style used by this environment, which is a
-#cumbersome one hot matrix with the positions of the agent, the walls and the
-#goal. this is why we defined the IntegerState and CartesianState styles
+################################ State Styles ##################################
 
-const SRUEnv = GW.RLBaseEnv{<:SingleRoomUndirected}
+struct IntegerState <: RLBase.AbstractStateStyle end
+struct CartesianState <: RLBase.AbstractStateStyle end
 
-function sru_env(; height = 8, width = 6, rng = Random.GLOBAL_RNG)
-    SingleRoomUndirected(; height, width, rng) |> GW.RLBaseEnv
+############################### GridWorld ######################################
+
+@enum GridAction begin
+    up = 1
+    down = 2
+    left = 3
+    right = 4
+    up_left = 5
+    down_left = 6
+    up_right = 7
+    down_right = 8
+    idle = 9
 end
 
-#state space comprises the whole tile map, so not all these states are actually
-#possible. some of them correspond to walls and therefore will remain unvisited
-function RLBase.state_space(sru::SRUEnv, ::CartesianState)
-    CartesianIndices((GW.get_height(sru.env), GW.get_width(sru.env)))
+function Base.CartesianIndex(action::GridAction)
+    action === up && return CartesianIndex((-1, 0))
+    action === down && return CartesianIndex((1, 0))
+    action === left && return CartesianIndex((0, -1))
+    action === right && return CartesianIndex((0, 1))
+    action === up_left && return CartesianIndex((-1, -1))
+    action === down_left && return CartesianIndex((1, -1))
+    action === up_right && return CartesianIndex((-1, 1))
+    action === down_right && return CartesianIndex((1, 1))
+    action === idle && return CartesianIndex((0, 0))
 end
 
-RLBase.state_space(sru::SRUEnv, ::IntegerState) = state_space(sru, CartesianState()) |> LinearIndices
-
-RLBase.state(sru::SRUEnv, ::CartesianState) = sru.env.agent_position
-
-function RLBase.state(sru::SRUEnv, ::IntegerState)
-    RLBase.state_space(sru, IntegerState())[sru.env.agent_position]
+function Base.Char(action::GridAction)
+    action === up && return '↑'
+    action === down && return '↓'
+    action === left && return '←'
+    action === right && return '→'
+    action === up_left && return '↖'
+    action === down_left && return '↙'
+    action === up_right && return '↗'
+    action === down_right && return '↘'
+    action === idle && return 'o'
 end
 
-############################# Agent ############################################
 
-struct SARSAAgent{NS, NA, R} <: RLBase.AbstractPolicy
-    policy::EpsGreedyPolicy{NS, NA, R}
-end
+mutable struct GridWorld{NS, NA, H, W, A} <: RLBase.AbstractEnv
+    const start::CartesianIndex{2}
+    const goal::CartesianIndex{2}
+    const walls::SizedMatrix{H, W, Bool, 2, Matrix{Bool}}
+    position::CartesianIndex{2}
 
-SARSAAgent(NS::Integer, NA::Integer, args...) = SARSAAgent(EpsGreedyPolicy(NS, NA, args...))
-SARSAAgent(env::RLBase.AbstractEnv, args...) = SARSAAgent(EpsGreedyPolicy(env, args...))
+    function GridWorld(;
+        H::Integer = 5, W::Integer = 7,
+        A::NTuple{NA, GridAction} = Tuple(a for a in instances(GridAction)),
+        start = CartesianIndex((H ÷ 2 + 1, 1)),
+        goal = CartesianIndex((H ÷ 2 + 1, W)),
+        walls = fill(false, H, W)) where {NA}
+        walls[1:(H-1), W ÷ 2] .= true
 
-(agent::SARSAAgent)(env::RLBase.AbstractEnv) = sample(agent.policy, state(env, IntegerState()))
+        NS = W*H
+        start = bound(start, H, W)
+        goal = bound(goal, H, W)
+        @assert !walls[start]
+        @assert !walls[goal]
 
-function SARSA_test()
-    sru = sru_env(rng = Xoshiro(0))
-    agent = SARSAAgent(sru)
-    i = 0
-    while !is_terminated(sru)
-        println(i)
-        action = agent(sru)
-        sru(action)
-        i += 1
+        position = start
+        new{NS, NA, H, W, A}(start, goal, walls, position)
     end
 end
 
-# struct ExpectedSarsa <: RLBase.AbstractPolicy
+bound(pos::CartesianIndex{2}, H::Integer, W::Integer) = CartesianIndex((clamp(pos[1], 1, H), clamp(pos[2], 1, W)))
+bound(pos::CartesianIndex{2}, ::GridWorld{NS, NA, H, W, A}) where {NS, NA, H, W, A} = bound(pos, H, W)
+
+RLBase.state_space(::GridWorld{NS, NA, H, W}, ::CartesianState) where {NS, NA, H, W} = CartesianIndices((H, W))
+RLBase.state_space(env::GridWorld, ::IntegerState) = RLBase.state_space(env, CartesianState()) |> LinearIndices
+RLBase.action_space(::GridWorld{NS, NA}) where {NS, NA} = Base.OneTo(NA)
+
+RLBase.state(env::GridWorld, ::CartesianState) = env.position
+RLBase.state(env::GridWorld, ::IntegerState) = RLBase.state_space(env, IntegerState())[env.position]
+RLBase.state(env::GridWorld) = RLBase.state(env, IntegerState())
+
+RLBase.reward(env::GridWorld) = (RLBase.is_terminated(env) ? 1.0 : 0.0)
+RLBase.is_terminated(env::GridWorld) = (env.position === env.goal ? true : false)
+RLBase.reset!(env::GridWorld) = (env.position = env.start)
+
+step!(env::GridWorld, action::Integer) = step!(env, A[action])
+
+function step!(env::GridWorld{NS, NA, H, W, A}, action::Integer) where {NS, NA, H, W, A}
+    step!(env, A[action])
+end
+
+function step!(env::GridWorld{NS, NA, H, W, A}, action::GridAction) where {NS, NA, H, W, A}
+    target = env.position + CartesianIndex(action)
+    target = bound(target, H, W)
+    env.position = env.walls[target] ? env.position : target
+    return env
+end
+
+(env::GridWorld)(action::Integer) = step!(env, action)
+
+function Base.show(io::IO, ::MIME"text/plain", env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
+    tile_map = fill('.', H, W)
+    tile_map[env.walls] .= '█'
+    tile_map[env.start] = 's'
+    tile_map[env.goal] = 'g'
+    tile_map[env.position] = 'p'
+    borderH = fill('█', H)
+    borderW = fill('█', 1, W+2)
+    tile_map = hcat(borderH, tile_map, borderH)
+    tile_map = vcat(borderW, tile_map, borderW)
+    str = ""
+    for row in eachrow(tile_map)
+        str = str * String(row) * "\n"
+    end
+
+    print(io, str)
+    # show(io, "text/plain", tile_map)
+    return nothing
+end
+
+
+# ############################# Agent ############################################
+
+# abstract type AbstractAgent end
+
+function show_best_actions(q::TabularQ{NS, NA}, env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
+    # v = Vector(get_best_actions(q)) #do away with the SVector
+    v = get_best_actions(q) #do away with the SVector
+    tile_map = Char.(GridAction.(reshape(v, H, W)))
+    tile_map[env.walls] .= '█'
+    borderH = fill('█', H)
+    borderW = fill('█', 1, W+2)
+    tile_map = hcat(borderH, tile_map, borderH)
+    tile_map = vcat(borderW, tile_map, borderW)
+    str = ""
+    for row in eachrow(tile_map)
+        str = str * String(row) * "\n"
+    end
+    print(str)
+    return nothing
+    # return tile_map
+end
+#on each episode, we get the best actions for all states from the TabularQ in
+#the agent's policy. these are integers. We then create a HxW matrix of ints.
+#1) current_best_actions = fill(GridActions(idle), H, W)
+#2) for state in state_space
+#   current_best_actions[state] loop over the state space get the best
+#   action (singular for each )
+
+# abstract type AbstractStage end
+# struct PreEpisode <: AbstractStage end
+# struct PreAction <: AbstractStage end
+# struct PostAction <: AbstractStage end
+
+# mutable struct SARSAAgent{NS, NA, R <: AbstractRNG} <: AbstractAgent
+#     const policy::EpsGreedyPolicy{NS, NA}
+#     const rng::R
+#     const ε_initial::Float64
+#     const ε_final::Float64
+#     const warmup_steps::UInt64
+#     const decay_steps::UInt64
+#     const γ::Float64
+#     const α::Float64
+#     training::Bool
+#     step::UInt64
+#     s0::UInt64
+#     a0::UInt64
 # end
-#ver video DeepMind
 
-#NO. Lo que tenemos que hacer es, dentro del agente, definir una QTable, y
-#despues construir una EpsGreedy que use esa QTable como source.
+# Random.seed!(agent::SARSAAgent, v::Integer) = seed!(agent.rng, v)
 
-#Porque el siguiente paso es desarrollar un agente que haga Q Learning, y para
-#eso necesitara almacenar dos policies, una target y una behavior. Pero en
-#general ambas podrian compartir la misma QTable. No, a ver. El que la
-#EpsGreedyPolicy contenga una QTable no significa necesariamente que sea
-#propietaria de ella. Puede tener una referencia a una QTable compartida con
-#otra policy. Pero eso no significa que la EpsGreedy no deba tener un campo q.
-#Debe tenerlo.
+# function SARSAAgent(env::RLBase.AbstractEnv;
+#     rng::AbstractRNG = Xoshiro(0), ε_initial::Real = 1.0, ε_final::Real = 0.05,
+#     warmup_steps = 0, decay_steps = 10000, γ::Real = 0.5, α::Real = 0.2)
 
-#Si hacemos double Q learning, necesitaremos 2 QTables. Pero necesitamos tambien
-#2 policies? No. Es más, cuando hacemos Q learning, la target QTable no necesita
-#estar embebida en una policy, porque no vamos a seguirla ni a necesitar obtener
-#probabilidades, solo su valor maximo.
+#     @assert 0 <= γ <= 1
+#     @assert 0 < α < 1
 
-#En general, para off-policy learning sí que necesitaremos una target Policy,
-#porque a la hora de ponderar las observaciones necesitamos probabilidades tanto
-#de la target como de la behavior, asi que la target no puede
-
-#podemos definir una <:AbstractPolicy que a su vez contenga otras dos
-#AbstractPolicies, aunque realmente eso empieza a parecerse mas a un Agent
-
-#el agente contiene la policy o la policy el agente? segun el enfoque de
-#ReinforcementLearning.jl, es lo segundo. una policy en general puede ser
-#stateful. puede contener a su vez dos policies e ir modificandolas
-
-
+#     policy = EpsGreedyPolicy(env)
+#     SARSAAgent(policy, rng, ε_initial, ε_final, UInt64(warmup_steps), UInt64(decay_steps), γ, α, true, UInt64(0), UInt64(0), UInt64(0))
 
 # end
+
+# function get_ε(agent::SARSAAgent)
+#     @unpack ε_initial, ε_final, warmup_steps, decay_steps, training, step = agent
+#     if training
+#         if step < warmup_steps
+#             ε = ε_initial
+#         elseif step < warmup_steps + decay_steps
+#             ε = ε_initial + (ε_final - ε_initial) / decay_steps * (step - warmup_steps)
+#         else
+#             ε = ε_final
+#         end
+#     else
+#         ε = 0
+#     end
+# end
+
+# #here we must NOT reset ε or step. these are kept across episodes
+# function (agent::SARSAAgent)(::PreEpisode, env::RLBase.AbstractEnv)
+#     @unpack policy, rng = agent
+#     agent.s0 = state(env, IntegerState())
+#     agent.a0 = sample(rng, set_ε!(policy, get_ε(agent)), agent.s0)
+# end
+
+# function (agent::SARSAAgent)(::PreAction, env::RLBase.AbstractEnv)
+#     #nothing to do here, the action for the next step is already chosen
+#     (it is previous a1)
+# end
+
+# get_action(agent::SARSAAgent, env::RLBase.AbstractEnv) = agent.a0
+
+# #here, our returned action has been applied to the environment, we are ready to
+# #observe the reward and the new state
+
+# function (agent::SARSAAgent)(::PostAction, env::RLBase.AbstractEnv)
+#     @unpack policy, rng, α, γ, s0, a0, training = agent
+#     @unpack q = policy
+
+#     r0 = reward(env)
+#     s1 = state(env, IntegerState())
+#     a1 = sample(rng, set_ε!(policy, get_ε(agent)), s0)
+#     if training
+#         q[s0, a0] += α * (r0 + γ * q[s1, a1] - q[s0, a0])
+#         agent.step += 1
+#     end
+#     agent.s0 = s1
+#     agent.a0 = a1
+# end
+
+# function run_episode(env::AbstractEnv, agent::AbstractAgent)
+#     reset!(env)
+#     agent(PreEpisode(), env)
+#     while !is_terminated(env)
+#         agent(PreAction(), env)
+#         action = get_action(agent)
+#         step!(env, action)
+#         agent(PostAction(), env)
+#     end
+# end
+
+# #define a stop condition: the best action is no longer changing for any state
+
+# function test_SARSA()
+#     #with γ = 1, the agent does not really learn to solve the SRU environment,
+#     #because without discounting the reward it gets at the end of the episode is
+#     #the same whether it takes the minimum number of steps or infinitely many to
+#     #get there
+#     #see how this works in terms of q values
+# end
+
+
+# # struct ExpectedSarsa <: RLBase.AbstractPolicy
+# # end
+# #ver video DeepMind
+
+# #NO. Lo que tenemos que hacer es, dentro del agente, definir una QTable, y
+# #despues construir una EpsGreedy que use esa QTable como source.
+
+# #Porque el siguiente paso es desarrollar un agente que haga Q Learning, y para
+# #eso necesitara almacenar dos policies, una target y una behavior. Pero en
+# #general ambas podrian compartir la misma QTable. No, a ver. El que la
+# #EpsGreedyPolicy contenga una QTable no significa necesariamente que sea
+# #propietaria de ella. Puede tener una referencia a una QTable compartida con
+# #otra policy. Pero eso no significa que la EpsGreedy no deba tener un campo q.
+# #Debe tenerlo.
+
+# #Si hacemos double Q learning, necesitaremos 2 QTables. Pero necesitamos tambien
+# #2 policies? No. Es más, cuando hacemos Q learning, la target QTable no necesita
+# #estar embebida en una policy, porque no vamos a seguirla ni a necesitar obtener
+# #probabilidades, solo su valor maximo.
+
+# #En general, para off-policy learning sí que necesitaremos una target Policy,
+# #porque a la hora de ponderar las observaciones necesitamos probabilidades tanto
+# #de la target como de la behavior, asi que la target no puede
+
+# #podemos definir una <:AbstractPolicy que a su vez contenga otras dos
+# #AbstractPolicies, aunque realmente eso empieza a parecerse mas a un Agent
+
+# #el agente contiene la policy o la policy el agente? segun el enfoque de
+# #ReinforcementLearning.jl, es lo segundo. una policy en general puede ser
+# #stateful. puede contener a su vez dos policies e ir modificandolas
+
+
+# # ############################### Environment ####################################
+
+# # #we don't want the default state style used by this environment, which is a
+# # #cumbersome one hot matrix with the positions of the agent, the walls and the
+# # #goal. this is why we defined the IntegerState and CartesianState styles
+
+# # const SRUEnv = GW.RLBaseEnv{<:SingleRoomUndirected}
+
+# # function sru_env(; height = 8, width = 6, rng = Random.GLOBAL_RNG)
+# #     SingleRoomUndirected(; height, width, rng) |> GW.RLBaseEnv
+# # end
+
+# # #state space comprises the whole tile map, so not all these states are actually
+# # #possible. some of them correspond to walls and therefore will remain unvisited
+# # function RLBase.state_space(sru::SRUEnv, ::CartesianState)
+# #     CartesianIndices((GW.get_height(sru.env), GW.get_width(sru.env)))
+# # end
+
+# # RLBase.state_space(sru::SRUEnv, ::IntegerState) = state_space(sru, CartesianState()) |> LinearIndices
+
+# # RLBase.state(sru::SRUEnv, ::CartesianState) = sru.env.agent_position
+
+# # function RLBase.state(sru::SRUEnv, ::IntegerState)
+# #     RLBase.state_space(sru, IntegerState())[sru.env.agent_position]
+# # end
+
+# # function reset_position!(sru::SRUEnv)
+# #     sru.env.agent_position = CartesianIndex(2, 2)
+# # end
+
+
+# # end
