@@ -8,6 +8,46 @@ import ReinforcementLearning.ReinforcementLearningBase as RLBase
 ################################################################################
 ################################################################################
 
+############################## ValueFunction ###################################
+
+abstract type AbstractV end
+
+struct TabularV{NS} <: AbstractV
+    data::SizedVector{NS, Float64, Vector{Float64}}
+end
+
+TabularV(NS::Integer) = TabularV{NS}(zeros(NS))
+
+get_value(v::TabularV, state::Integer) = v.data[state]
+
+
+########################### ActionValueFunction ################################
+
+abstract type AbstractQ{NA} end
+
+struct TabularQ{NS, NA} <: AbstractQ{NA}
+    data::SizedMatrix{NS, NA, Float64, 2, Matrix{Float64}}
+end
+
+TabularQ(NS::Integer, NA::Integer) = TabularQ{NS, NA}(zeros(NS, NA))
+
+get_action_values(q::TabularQ, state::Integer) = view(q.data, state, :)
+get_max_value(q::TabularQ, state::Integer) = findmax(get_action_values(q, state))[1]
+
+#returns a boolean vector indicating all the (equally) best actions for a given
+#state. we use a SVector assuming NA is reasonably small
+function get_best_actions(q::TabularQ{NS, NA}, state::Integer)::SVector{NA, Bool} where {NS, NA}
+    q_row = SVector{NA}(get_action_values(q, state))
+    q_max = findmax(q_row)[1]
+    return q_row .== q_max
+end
+
+#returns a vector with the indices of the first best action for each state. we
+#use a SVector assuming NS is reasonably small
+function get_best_actions(q::TabularQ{NS, NA}) where {NS, NA}
+    sacollect(SVector{NS,Int}, findmax(get_best_actions(q, state))[2] for state in 1:NS)
+end
+
 ############################## AbstractPolicy ##################################
 
 abstract type AbstractPolicy end
@@ -19,6 +59,18 @@ abstract type AbstractDiscretePolicy{NA} <: AbstractPolicy end
 get_probs(::AbstractDiscretePolicy, ::Any) = error("Not implemented")
 #returns the probability of the specified state-action pair
 get_prob(::AbstractDiscretePolicy, ::Any, ::Any) = error("Not implemented")
+
+TabularV(q::TabularQ{NS, NA}, p::AbstractDiscretePolicy{NA}) where {NS, NA} = TabularV(NS)(q, p)
+
+function (v::TabularV{NS})(q::TabularQ{NS, NA}, p::AbstractDiscretePolicy{NA}) where {NS, NA}
+    for state in eachindex(v.data)
+        action_values = SVector{NA}(get_action_values(q, state))
+        action_probs = SVector{NA}(get_probs(p, state))
+        v.data[state] = sum(action_values .* action_probs)
+    end
+    return v
+end
+
 
 ############################## RandomPolicy ####################################
 
@@ -46,33 +98,6 @@ StatsBase.sample(rng::AbstractRNG, policy::RandomPolicy, ::Integer) = sample(rng
 StatsBase.sample(policy::RandomPolicy, args...) = sample(Random.GLOBAL_RNG, policy, args...)
 
 
-############################## ActionValue #####################################
-
-abstract type AbstractQ{NA} end
-
-struct TabularQ{NS, NA} <: AbstractQ{NA}
-    data::SizedMatrix{NS, NA, Float64, 2, Matrix{Float64}}
-end
-
-TabularQ(NS::Integer, NA::Integer) = TabularQ{NS, NA}(zeros(NS, NA))
-
-get_action_values(q::TabularQ, state::Integer) = view(q.data, state, :)
-get_max_value(q::TabularQ, state::Integer) = findmax(get_action_values(q, state))[1]
-
-#returns a boolean vector indicating all the (equally) best actions for a given
-#state. we use a SVector assuming NA is reasonably small
-function get_best_actions(q::TabularQ{NS, NA}, state::Integer)::SVector{NA, Bool} where {NS, NA}
-    q_row = SVector{NA}(get_action_values(q, state))
-    q_max = findmax(q_row)[1]
-    return q_row .== q_max
-end
-
-#returns a vector with the indices of the first best action for each state. we
-#use a SVector assuming NS is reasonably small
-function get_best_actions(q::TabularQ{NS, NA}) where {NS, NA}
-    sacollect(SVector{NS,Int}, findmax(get_best_actions(q, state))[2] for state in 1:NS)
-end
-
 # ############################## EpsGreedyPolicy #################################
 
 #NA: Number of (discrete) actions
@@ -90,12 +115,6 @@ end
 
 EpsGreedyPolicy(NS::Integer, NA::Integer, args...) = EpsGreedyPolicy(TabularQ(NS, NA), args...)
 
-function EpsGreedyPolicy(env::RLBase.AbstractEnv, args...)
-    NS = RLBase.state_space(env, IntegerState()) |> length
-    NA = RLBase.action_space(env) |> length
-    EpsGreedyPolicy(NS, NA, args...)
-end
-
 function set_ε!(policy::EpsGreedyPolicy, ε::Real)
     @assert 0 <= ε <= 1
     policy.ε = ε
@@ -106,9 +125,9 @@ function get_probs(policy::EpsGreedyPolicy{NA, Q}, state::Integer) where {NA, Q}
     ε = policy.ε
     best_actions = get_best_actions(policy.q, state)
     n_best = count(best_actions)
-    p_best = 1/n_best * (1-ε + ε/NA)
-    p_others = ε/NA*(NA-1)/(NA-n_best)
-    sacollect(SVector{NA, Float64}, (best_actions[action] ? p_best : p_others) for action in 1:NA)
+    p_best = (1-ε)/n_best + ε/NA
+    p_rest = ε/NA
+    sacollect(SVector{NA, Float64}, (best_actions[action] ? p_best : p_rest) for action in 1:NA)
 end
 
 function get_prob(policy::EpsGreedyPolicy, state::Integer, action::Integer)
@@ -130,7 +149,51 @@ StatsBase.sample(policy::EpsGreedyPolicy, args...) = sample(Random.GLOBAL_RNG, p
 struct IntegerState <: RLBase.AbstractStateStyle end
 struct CartesianState <: RLBase.AbstractStateStyle end
 
-############################### GridWorld ######################################
+######################### AbstractTabularEnv ###################################
+
+abstract type AbstractTabularEnv{NS, NA} <: RLBase.AbstractEnv end
+
+TabularV(::AbstractTabularEnv{NS, NA}) where {NS, NA} = TabularV(NS)
+TabularQ(::AbstractTabularEnv{NS, NA}) where {NS, NA} = TabularQ(NS, NA)
+
+function TD0_eval(policy::AbstractDiscretePolicy{NA},
+                  env::AbstractTabularEnv{NS, NA}; kwargs...) where {NS, NA}
+    v = TabularV(NS)
+    TD0_eval!(v, policy, env; kwargs...) #preallocate tabular value function
+    return v
+end
+
+function TD0_eval!(v::TabularV{NS},
+                   policy::AbstractDiscretePolicy{NA},
+                   env::AbstractTabularEnv{NS, NA};
+                   γ::Float64 = 0.95,
+                   α0::Real = 1e-1,
+                   αf::Real = 1e-5,
+                   n_iter::Int = 10000) where {NS, NA}
+
+
+    a = log(α0/αf) / n_iter
+    for i in 1:n_iter
+        RLBase.reset!(env)
+        s0 = RLBase.state(env)
+        α = α0*exp(-a*i)
+        while !RLBase.is_terminated(env)
+            a0 = sample(policy, s0)
+            step!(env, a0)
+            r1 = RLBase.reward(env)
+            s1 = RLBase.state(env)
+            v.data[s0] += α * (r1 + γ*v.data[s1] - v.data[s0])
+            s0 = s1
+        end
+    end
+    return v
+end
+
+function EpsGreedyPolicy(::AbstractTabularEnv{NS, NA}, args...) where {NS, NA}
+    EpsGreedyPolicy(NS, NA, args...)
+end
+
+############################ GridWorld #########################################
 
 @enum GridAction begin
     up = 1
@@ -169,7 +232,7 @@ function Base.Char(action::GridAction)
 end
 
 
-mutable struct GridWorld{NS, NA, H, W, A} <: RLBase.AbstractEnv
+mutable struct GridWorld{NS, NA, H, W, A} <: AbstractTabularEnv{NS, NA}
     const start::CartesianIndex{2}
     const goal::CartesianIndex{2}
     const walls::SizedMatrix{H, W, Bool, 2, Matrix{Bool}}
@@ -177,11 +240,15 @@ mutable struct GridWorld{NS, NA, H, W, A} <: RLBase.AbstractEnv
 
     function GridWorld(;
         H::Integer = 5, W::Integer = 7,
-        A::NTuple{NA, GridAction} = Tuple(a for a in instances(GridAction)),
+        # A::NTuple{NA, GridAction} = Tuple(a for a in instances(GridAction)),
+        A::NTuple{NA, GridAction} = (up, down, left, right),
         start = CartesianIndex((H ÷ 2 + 1, 1)),
         goal = CartesianIndex((H ÷ 2 + 1, W)),
         walls = fill(false, H, W)) where {NA}
-        walls[1:(H-1), W ÷ 2] .= true
+
+        walls[2, 4:(W÷2) + 2] .= true
+        walls[H-1, (W÷2):end-1] .= true
+        walls[2:(H-1), W÷2 + 2] .= true
 
         NS = W*H
         start = bound(start, H, W)
@@ -199,6 +266,7 @@ bound(pos::CartesianIndex{2}, ::GridWorld{NS, NA, H, W, A}) where {NS, NA, H, W,
 
 RLBase.state_space(::GridWorld{NS, NA, H, W}, ::CartesianState) where {NS, NA, H, W} = CartesianIndices((H, W))
 RLBase.state_space(env::GridWorld, ::IntegerState) = RLBase.state_space(env, CartesianState()) |> LinearIndices
+RLBase.state_space(env::GridWorld) = RLBase.state_space(env, IntegerState())
 RLBase.action_space(::GridWorld{NS, NA}) where {NS, NA} = Base.OneTo(NA)
 
 RLBase.state(env::GridWorld, ::CartesianState) = env.position
@@ -244,16 +312,26 @@ function Base.show(io::IO, ::MIME"text/plain", env::GridWorld{NS, NA, H, W}) whe
     return nothing
 end
 
-
-# ############################# Agent ############################################
-
-# abstract type AbstractAgent end
+# function show_values(v::TabularV{NS}, env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
+#     tile_map = reshape(v.data, H, W)
+#     tile_map[env.walls] .= '█'
+#     borderH = fill('█', H)
+#     borderW = fill('█', 1, W+2)
+#     tile_map = hcat(borderH, tile_map, borderH)
+#     tile_map = vcat(borderW, tile_map, borderW)
+#     str = ""
+#     for row in eachrow(tile_map)
+#         str = str * String(row) * "\n"
+#     end
+#     print(str)
+#     return nothing
+# end
 
 function show_best_actions(q::TabularQ{NS, NA}, env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
-    # v = Vector(get_best_actions(q)) #do away with the SVector
-    v = get_best_actions(q) #do away with the SVector
-    tile_map = Char.(GridAction.(reshape(v, H, W)))
+    tile_map = reshape(Vector(Char.(GridAction.(get_best_actions(q)))), H, W)
     tile_map[env.walls] .= '█'
+    tile_map[env.start] = 's'
+    tile_map[env.goal] = 'g'
     borderH = fill('█', H)
     borderW = fill('█', 1, W+2)
     tile_map = hcat(borderH, tile_map, borderH)
@@ -264,106 +342,103 @@ function show_best_actions(q::TabularQ{NS, NA}, env::GridWorld{NS, NA, H, W}) wh
     end
     print(str)
     return nothing
-    # return tile_map
 end
-#on each episode, we get the best actions for all states from the TabularQ in
-#the agent's policy. these are integers. We then create a HxW matrix of ints.
-#1) current_best_actions = fill(GridActions(idle), H, W)
-#2) for state in state_space
-#   current_best_actions[state] loop over the state space get the best
-#   action (singular for each )
 
-# abstract type AbstractStage end
-# struct PreEpisode <: AbstractStage end
-# struct PreAction <: AbstractStage end
-# struct PostAction <: AbstractStage end
 
-# mutable struct SARSAAgent{NS, NA, R <: AbstractRNG} <: AbstractAgent
-#     const policy::EpsGreedyPolicy{NS, NA}
-#     const rng::R
-#     const ε_initial::Float64
-#     const ε_final::Float64
-#     const warmup_steps::UInt64
-#     const decay_steps::UInt64
-#     const γ::Float64
-#     const α::Float64
-#     training::Bool
-#     step::UInt64
-#     s0::UInt64
-#     a0::UInt64
-# end
+# ############################# Agent ############################################
 
-# Random.seed!(agent::SARSAAgent, v::Integer) = seed!(agent.rng, v)
+abstract type AbstractAgent end
 
-# function SARSAAgent(env::RLBase.AbstractEnv;
-#     rng::AbstractRNG = Xoshiro(0), ε_initial::Real = 1.0, ε_final::Real = 0.05,
-#     warmup_steps = 0, decay_steps = 10000, γ::Real = 0.5, α::Real = 0.2)
+abstract type AbstractStage end
+struct PreEpisode <: AbstractStage end
+struct PreAction <: AbstractStage end
+struct PostAction <: AbstractStage end
 
-#     @assert 0 <= γ <= 1
-#     @assert 0 < α < 1
+mutable struct TabularSARSA{NS, NA, R <: AbstractRNG} <: AbstractAgent
+    const policy::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
+    const rng::R
+    const ε_initial::Float64
+    const ε_final::Float64
+    const warmup_steps::Int
+    const decay_steps::Int
+    const γ::Float64
+    const α::Float64
+    training::Bool
+    step::Int
+    s0::Int
+    a0::Int
+end
 
-#     policy = EpsGreedyPolicy(env)
-#     SARSAAgent(policy, rng, ε_initial, ε_final, UInt64(warmup_steps), UInt64(decay_steps), γ, α, true, UInt64(0), UInt64(0), UInt64(0))
+Random.seed!(agent::TabularSARSA, v::Integer) = seed!(agent.rng, v)
 
-# end
+function TabularSARSA(env::AbstractTabularEnv;
+    rng::AbstractRNG = Xoshiro(0), ε_initial::Real = 1.0, ε_final::Real = 0.1,
+    warmup_steps = 1000, decay_steps = 1000, γ::Real = 0.5, α::Real = 0.2)
 
-# function get_ε(agent::SARSAAgent)
-#     @unpack ε_initial, ε_final, warmup_steps, decay_steps, training, step = agent
-#     if training
-#         if step < warmup_steps
-#             ε = ε_initial
-#         elseif step < warmup_steps + decay_steps
-#             ε = ε_initial + (ε_final - ε_initial) / decay_steps * (step - warmup_steps)
-#         else
-#             ε = ε_final
-#         end
-#     else
-#         ε = 0
-#     end
-# end
+    @assert 0 <= γ <= 1
+    @assert 0 < α < 1
 
-# #here we must NOT reset ε or step. these are kept across episodes
-# function (agent::SARSAAgent)(::PreEpisode, env::RLBase.AbstractEnv)
-#     @unpack policy, rng = agent
-#     agent.s0 = state(env, IntegerState())
-#     agent.a0 = sample(rng, set_ε!(policy, get_ε(agent)), agent.s0)
-# end
+    policy = EpsGreedyPolicy(env)
+    TabularSARSA(policy, rng, ε_initial, ε_final, warmup_steps, decay_steps, γ, α, true, 0, 0, 0)
+end
 
-# function (agent::SARSAAgent)(::PreAction, env::RLBase.AbstractEnv)
-#     #nothing to do here, the action for the next step is already chosen
-#     (it is previous a1)
-# end
+function get_ε(agent::TabularSARSA)
+    @unpack ε_initial, ε_final, warmup_steps, decay_steps, training, step = agent
+    if training
+        if step < warmup_steps
+            ε = ε_initial
+        elseif step < warmup_steps + decay_steps
+            ε = ε_initial + (ε_final - ε_initial) / decay_steps * (step - warmup_steps)
+        else
+            ε = ε_final
+        end
+    else
+        ε = 0
+    end
+end
 
-# get_action(agent::SARSAAgent, env::RLBase.AbstractEnv) = agent.a0
+#we must NOT reset ε or step. these should be kept across episodes
+function (agent::TabularSARSA)(::PreEpisode, env::RLBase.AbstractEnv)
+    @unpack policy, rng = agent
+    agent.s0 = RLBase.state(env, IntegerState())
+    agent.a0 = sample(rng, set_ε!(policy, get_ε(agent)), agent.s0)
+end
 
-# #here, our returned action has been applied to the environment, we are ready to
-# #observe the reward and the new state
+#nothing to do here, the action for the next step is already chosen (it is
+#the previous a1)
+(agent::TabularSARSA)(::PreAction, env::RLBase.AbstractEnv) = nothing
 
-# function (agent::SARSAAgent)(::PostAction, env::RLBase.AbstractEnv)
-#     @unpack policy, rng, α, γ, s0, a0, training = agent
-#     @unpack q = policy
+get_action(agent::TabularSARSA, ::RLBase.AbstractEnv) = agent.a0
 
-#     r0 = reward(env)
-#     s1 = state(env, IntegerState())
-#     a1 = sample(rng, set_ε!(policy, get_ε(agent)), s0)
-#     if training
-#         q[s0, a0] += α * (r0 + γ * q[s1, a1] - q[s0, a0])
-#         agent.step += 1
-#     end
-#     agent.s0 = s1
-#     agent.a0 = a1
-# end
+function (agent::TabularSARSA)(::PostAction, env::RLBase.AbstractEnv)
+    @unpack policy, rng, α, γ, s0, a0, training = agent
+    q = policy.q.data
 
-# function run_episode(env::AbstractEnv, agent::AbstractAgent)
-#     reset!(env)
-#     agent(PreEpisode(), env)
-#     while !is_terminated(env)
-#         agent(PreAction(), env)
-#         action = get_action(agent)
-#         step!(env, action)
-#         agent(PostAction(), env)
-#     end
-# end
+    r0 = RLBase.reward(env)
+    s1 = RLBase.state(env, IntegerState())
+    a1 = sample(rng, set_ε!(policy, get_ε(agent)), s0)
+    if training
+        q[s0, a0] += α * (r0 + γ * q[s1, a1] - q[s0, a0])
+        agent.step += 1
+    end
+    agent.s0 = s1
+    agent.a0 = a1
+end
+
+function run_episodes(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
+    for _ in 1:n
+        RLBase.reset!(env)
+        agent(PreEpisode(), env)
+        while !RLBase.is_terminated(env)
+            agent(PreAction(), env)
+            action = get_action(agent, env)
+            step!(env, action)
+            agent(PostAction(), env)
+        end
+    end
+end
+
+#next: off policy: Q learning and Expected Sarsa
 
 # #define a stop condition: the best action is no longer changing for any state
 
