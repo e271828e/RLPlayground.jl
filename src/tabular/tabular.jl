@@ -32,7 +32,6 @@ end
 TabularQ(NS::Integer, NA::Integer) = TabularQ{NS, NA}(zeros(NS, NA))
 
 get_action_values(q::TabularQ, state::Integer) = view(q.data, state, :)
-get_max_value(q::TabularQ, state::Integer) = findmax(get_action_values(q, state))[1]
 
 #returns a boolean vector indicating all the (equally) best actions for a given
 #state. we use a SVector assuming NA is reasonably small
@@ -42,11 +41,19 @@ function get_best_actions(q::TabularQ{NS, NA}, state::Integer)::SVector{NA, Bool
     return q_row .== q_max
 end
 
-#returns a vector with the indices of the first best action for each state. we
-#use a SVector assuming NS is reasonably small
+# returns a vector with the indices of the first best action for each state. we
+# use a SVector assuming NS is reasonably small
 function get_best_actions(q::TabularQ{NS, NA}) where {NS, NA}
     sacollect(SVector{NS,Int}, findmax(get_best_actions(q, state))[2] for state in 1:NS)
 end
+
+# function get_best_actions(q::TabularQ{NS, NA}) where {NS, NA}
+#     a = zeros(SizedVector{NS,Int})
+#     for state in 1:NS
+#         a[state] = findmax(get_best_actions(q, state))[2]
+#     end
+#     return a
+# end
 
 ############################## AbstractPolicy ##################################
 
@@ -56,21 +63,26 @@ abstract type AbstractPolicy end
 abstract type AbstractDiscretePolicy{NA} <: AbstractPolicy end
 
 #returns the probability of each action in the given state
-get_probs(::AbstractDiscretePolicy, ::Any) = error("Not implemented")
+get_action_probs(::AbstractDiscretePolicy, ::Any) = error("Not implemented")
+
 #returns the probability of the specified state-action pair
-get_prob(::AbstractDiscretePolicy, ::Any, ::Any) = error("Not implemented")
+get_action_prob(::AbstractDiscretePolicy, ::Any, ::Any) = error("Not implemented")
 
-TabularV(q::TabularQ{NS, NA}, p::AbstractDiscretePolicy{NA}) where {NS, NA} = TabularV(NS)(q, p)
+#returns the value of the specified state, given the policy and the action value
+function get_value(policy::AbstractDiscretePolicy{NA}, q::AbstractQ, state::Integer) where {NA}
+    action_probs = SVector{NA}(get_action_probs(policy, state))
+    action_values = SVector{NA}(get_action_values(q, state))
+    return sum(action_probs .* action_values)
+end
 
-function (v::TabularV{NS})(q::TabularQ{NS, NA}, p::AbstractDiscretePolicy{NA}) where {NS, NA}
+function (v::TabularV{NS})(q::TabularQ{NS, NA}, policy::AbstractDiscretePolicy{NA}) where {NS, NA}
     for state in eachindex(v.data)
-        action_values = SVector{NA}(get_action_values(q, state))
-        action_probs = SVector{NA}(get_probs(p, state))
-        v.data[state] = sum(action_values .* action_probs)
+        v.data[state] = get_value(policy, q, state)
     end
     return v
 end
 
+TabularV(q::TabularQ{NS, NA}, p::AbstractDiscretePolicy{NA}) where {NS, NA} = TabularV(NS)(q, p)
 
 ############################## RandomPolicy ####################################
 
@@ -91,8 +103,8 @@ end
 RandomPolicy(NA::Integer) = RandomPolicy(fill(1/NA, NA))
 RandomPolicy(env::RLBase.AbstractEnv) = RandomPolicy(RLBase.action_space(env) |> length)
 
-get_probs(policy::RandomPolicy, ::Integer) = policy.weights.values #values(weights) allocates
-get_prob(policy::RandomPolicy, state::Integer, action::Integer) = get_probs(policy, state)[action]
+get_action_probs(policy::RandomPolicy, ::Integer) = policy.weights.values #values(weights) allocates
+get_action_prob(policy::RandomPolicy, state::Integer, action::Integer) = get_action_probs(policy, state)[action]
 
 StatsBase.sample(rng::AbstractRNG, policy::RandomPolicy, ::Integer) = sample(rng, policy.weights)
 StatsBase.sample(policy::RandomPolicy, args...) = sample(Random.GLOBAL_RNG, policy, args...)
@@ -121,7 +133,7 @@ function set_ε!(policy::EpsGreedyPolicy, ε::Real)
     return policy
 end
 
-function get_probs(policy::EpsGreedyPolicy{NA, Q}, state::Integer) where {NA, Q}
+function get_action_probs(policy::EpsGreedyPolicy{NA, Q}, state::Integer) where {NA, Q}
     ε = policy.ε
     best_actions = get_best_actions(policy.q, state)
     n_best = count(best_actions)
@@ -130,13 +142,17 @@ function get_probs(policy::EpsGreedyPolicy{NA, Q}, state::Integer) where {NA, Q}
     sacollect(SVector{NA, Float64}, (best_actions[action] ? p_best : p_rest) for action in 1:NA)
 end
 
-function get_prob(policy::EpsGreedyPolicy, state::Integer, action::Integer)
-    get_probs(policy, state)[action]
+function get_action_prob(policy::EpsGreedyPolicy, state::Integer, action::Integer)
+    get_action_probs(policy, state)[action]
+end
+
+function get_value(policy::EpsGreedyPolicy{NA, TabularQ{NS, NA}}, state::Integer) where {NS, NA}
+    get_value(policy, policy.q, state)
 end
 
 function StatsBase.sample(rng::AbstractRNG, policy::EpsGreedyPolicy, state::Integer)
     @unpack _weights = policy
-    _weights.values .= get_probs(policy, state) #avoids a new ProbabilityWeights, which allocates
+    _weights.values .= get_action_probs(policy, state) #avoids a new ProbabilityWeights, which allocates
     _weights.sum = 1 #RLBase.prob(policy, state) sum to 1 by construction
     sample(rng, _weights)
 end
@@ -240,8 +256,8 @@ mutable struct GridWorld{NS, NA, H, W, A} <: AbstractTabularEnv{NS, NA}
 
     function GridWorld(;
         H::Integer = 5, W::Integer = 7,
-        # A::NTuple{NA, GridAction} = Tuple(a for a in instances(GridAction)),
-        A::NTuple{NA, GridAction} = (up, down, left, right),
+        A::NTuple{NA, GridAction} = Tuple(a for a in instances(GridAction)),
+        # A::NTuple{NA, GridAction} = (up, down, left, right),
         start = CartesianIndex((H ÷ 2 + 1, 1)),
         goal = CartesianIndex((H ÷ 2 + 1, W)),
         walls = fill(false, H, W)) where {NA}
@@ -285,12 +301,12 @@ end
 
 function step!(env::GridWorld{NS, NA, H, W, A}, action::GridAction) where {NS, NA, H, W, A}
     target = env.position + CartesianIndex(action)
-    target = bound(target, H, W)
-    env.position = env.walls[target] ? env.position : target
+    valid = (target == bound(target, H, W)) && !env.walls[target]
+    env.position = valid ? target : env.position
     return env
 end
 
-(env::GridWorld)(action::Integer) = step!(env, action)
+(env::GridWorld)(action) = step!(env, action)
 
 function Base.show(io::IO, ::MIME"text/plain", env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
     tile_map = fill('.', H, W)
@@ -312,21 +328,6 @@ function Base.show(io::IO, ::MIME"text/plain", env::GridWorld{NS, NA, H, W}) whe
     return nothing
 end
 
-# function show_values(v::TabularV{NS}, env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
-#     tile_map = reshape(v.data, H, W)
-#     tile_map[env.walls] .= '█'
-#     borderH = fill('█', H)
-#     borderW = fill('█', 1, W+2)
-#     tile_map = hcat(borderH, tile_map, borderH)
-#     tile_map = vcat(borderW, tile_map, borderW)
-#     str = ""
-#     for row in eachrow(tile_map)
-#         str = str * String(row) * "\n"
-#     end
-#     print(str)
-#     return nothing
-# end
-
 function show_best_actions(q::TabularQ{NS, NA}, env::GridWorld{NS, NA, H, W}) where {NS, NA, H, W}
     tile_map = reshape(Vector(Char.(GridAction.(get_best_actions(q)))), H, W)
     tile_map[env.walls] .= '█'
@@ -345,84 +346,198 @@ function show_best_actions(q::TabularQ{NS, NA}, env::GridWorld{NS, NA, H, W}) wh
 end
 
 
-# ############################# Agent ############################################
+############################### Agent ############################################
 
 abstract type AbstractAgent end
 
 abstract type AbstractStage end
+struct PreExperiment <: AbstractStage end
 struct PreEpisode <: AbstractStage end
 struct PreAction <: AbstractStage end
 struct PostAction <: AbstractStage end
 
-mutable struct TabularSARSA{NS, NA, R <: AbstractRNG} <: AbstractAgent
+############################## TabularQExplorer ################################
+
+mutable struct TabularQExplorer{NS, NA, R <: AbstractRNG} <: AbstractAgent
     const policy::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
     const rng::R
     const ε_initial::Float64
     const ε_final::Float64
     const warmup_steps::Int
     const decay_steps::Int
+    step::Int
+    function TabularQExplorer(
+                policy::EpsGreedyPolicy{NA, TabularQ{NS, NA}};
+                rng::R = Xoshiro(0),
+                ε_initial::Real = 1.0, ε_final::Real = 0.2,
+                warmup_steps::Int = 10000, decay_steps::Int = 10000) where {NS, NA, R}
+        new{NS, NA, R}(policy, rng, ε_initial, ε_final, warmup_steps, decay_steps, 0)
+    end
+end
+
+#in general, we will typically want to provide an external TabularQ or
+#EpsGreedyPolicy to the explorer, because if we initialize its Q to zero, the
+#explorer has no means of updating it by itself
+TabularQExplorer(q::TabularQ; kwargs...) = TabularQExplorer(EpsGreedyPolicy(q); kwargs...)
+
+Random.seed!(agent::TabularQExplorer, v::Integer) = seed!(agent.rng, v)
+
+function get_ε(agent::TabularQExplorer)
+    @unpack ε_initial, ε_final, warmup_steps, decay_steps, step = agent
+    if step < warmup_steps
+        ε = ε_initial
+    elseif step < warmup_steps + decay_steps
+        ε = ε_initial + (ε_final - ε_initial) / decay_steps * (step - warmup_steps)
+    else
+        ε = ε_final
+    end
+end
+
+(agent::TabularQExplorer)(::PreExperiment, ::AbstractTabularEnv) = (agent.step = 0)
+(agent::TabularQExplorer)(::PreEpisode, ::AbstractTabularEnv) = nothing
+(agent::TabularQExplorer)(::PreAction, ::AbstractTabularEnv) = set_ε!(agent.policy, get_ε(agent))
+
+get_action(agent::TabularQExplorer, state::Integer) = sample(agent.rng, agent.policy, state)
+# get_action(agent::TabularQExplorer, env::AbstractTabularEnv) = get_action(agent, RLBase.state(env, IntegerState()))
+
+(agent::TabularQExplorer)(::PostAction, ::AbstractTabularEnv) = (agent.step += 1)
+
+############################## Tabular SARSA ###################################
+
+mutable struct TabularSARSA{NS, NA, R <: AbstractRNG} <: AbstractAgent
+    const explorer::TabularQExplorer{NS, NA, R}
     const γ::Float64
     const α::Float64
-    training::Bool
-    step::Int
     s0::Int
     a0::Int
-end
-
-Random.seed!(agent::TabularSARSA, v::Integer) = seed!(agent.rng, v)
-
-function TabularSARSA(env::AbstractTabularEnv;
-    rng::AbstractRNG = Xoshiro(0), ε_initial::Real = 1.0, ε_final::Real = 0.1,
-    warmup_steps = 1000, decay_steps = 1000, γ::Real = 0.5, α::Real = 0.2)
-
-    @assert 0 <= γ <= 1
-    @assert 0 < α < 1
-
-    policy = EpsGreedyPolicy(env)
-    TabularSARSA(policy, rng, ε_initial, ε_final, warmup_steps, decay_steps, γ, α, true, 0, 0, 0)
-end
-
-function get_ε(agent::TabularSARSA)
-    @unpack ε_initial, ε_final, warmup_steps, decay_steps, training, step = agent
-    if training
-        if step < warmup_steps
-            ε = ε_initial
-        elseif step < warmup_steps + decay_steps
-            ε = ε_initial + (ε_final - ε_initial) / decay_steps * (step - warmup_steps)
-        else
-            ε = ε_final
-        end
-    else
-        ε = 0
+    function TabularSARSA(explorer::TabularQExplorer{NS, NA, R}; γ::Real = 0.9, α::Real = 0.1) where {NS, NA, R}
+        @assert 0 <= γ <= 1
+        @assert 0 < α < 1
+        new{NS, NA, R}(explorer, γ, α, 0, 0)
     end
 end
 
-#we must NOT reset ε or step. these should be kept across episodes
-function (agent::TabularSARSA)(::PreEpisode, env::RLBase.AbstractEnv)
-    @unpack policy, rng = agent
+#default explorer
+function TabularSARSA(env::AbstractTabularEnv; kwargs...)
+    TabularSARSA(TabularQExplorer(EpsGreedyPolicy(env)); kwargs...)
+end
+
+Random.seed!(agent::TabularSARSA, v::Integer) = seed!(agent.explorer, v)
+
+(agent::TabularSARSA)(stage::PreExperiment, env::AbstractTabularEnv) = agent.explorer(stage, env)
+
+function (agent::TabularSARSA)(stage::PreEpisode, env::AbstractTabularEnv)
     agent.s0 = RLBase.state(env, IntegerState())
-    agent.a0 = sample(rng, set_ε!(policy, get_ε(agent)), agent.s0)
+    agent.a0 = get_action(agent.explorer, agent.s0)
+    agent.explorer(stage, env)
 end
 
-#nothing to do here, the action for the next step is already chosen (it is
-#the previous a1)
-(agent::TabularSARSA)(::PreAction, env::RLBase.AbstractEnv) = nothing
+(agent::TabularSARSA)(stage::PreAction, env::AbstractTabularEnv) = agent.explorer(stage, env)
 
-get_action(agent::TabularSARSA, ::RLBase.AbstractEnv) = agent.a0
+#the action to apply is the one computed and stored on the previous PostAction
+#update
+get_action(agent::TabularSARSA, ::Any) = agent.a0
 
-function (agent::TabularSARSA)(::PostAction, env::RLBase.AbstractEnv)
-    @unpack policy, rng, α, γ, s0, a0, training = agent
-    q = policy.q.data
+function (agent::TabularSARSA)(stage::PostAction, env::AbstractTabularEnv)
+    @unpack explorer, α, γ, s0, a0 = agent
+    q = explorer.policy.q.data
 
-    r0 = RLBase.reward(env)
+    r1 = RLBase.reward(env)
     s1 = RLBase.state(env, IntegerState())
-    a1 = sample(rng, set_ε!(policy, get_ε(agent)), s0)
-    if training
-        q[s0, a0] += α * (r0 + γ * q[s1, a1] - q[s0, a0])
-        agent.step += 1
-    end
+    a1 = get_action(agent.explorer, s1)
+
+    q[s0, a0] += α * (r1 + γ * q[s1, a1] - q[s0, a0])
+
     agent.s0 = s1
     agent.a0 = a1
+
+    agent.explorer(stage, env)
+end
+
+
+############################## TabularExpectedSARSA ############################
+
+#In this implementation, the target and behaviour policies share the same Q,
+#even if they can act with different degrees of greediness with respect to it.
+#For example, the target policy could have ε = 0 (in which case the algorithm
+#particularizes to Q-learning) while the behaviour policy could have a decaying
+#ε, from a purely random policy at the beginning (ε = 1) to a purely greedy one
+#in the limit.
+
+#The shared Q means that the prediction error in Q at any given moment affects
+#the subsequent choice of action. Therefore, both target and behaviour policies
+#are correlated and the algorithm is subject to maximization bias. This would
+#not be the case if the behaviour policy were for example a purely random one,
+#or an ε-greedy one, but using a different, non-updating Q table.
+
+#TabularExpectedSARSA generalizes TabularSARSA. TabularSARSA is just
+#TabularExpectedSARSA but passing the explorer's own EpsGreedyPolicy as a
+#target. And using deterministic instead of stochastic updates.
+
+mutable struct TabularExpectedSARSA{NS, NA, R <: AbstractRNG} <: AbstractAgent
+    const target::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
+    const explorer::TabularQExplorer{NS, NA, R}
+    const γ::Float64
+    const α::Float64
+    s0::Int
+    a0::Int
+    function TabularExpectedSARSA(target::EpsGreedyPolicy{NA, TabularQ{NS, NA}},
+                                  explorer::TabularQExplorer{NS, NA, R};
+                                  γ::Real = 0.9, α::Real = 0.8) where {NS, NA, R}
+        @assert 0 <= γ <= 1
+        @assert 0 < α < 1
+        new{NS, NA, R}(target, explorer, γ, α, 0, 0)
+    end
+end
+
+function TabularExpectedSARSA(env::AbstractTabularEnv; kwargs...)
+    target = EpsGreedyPolicy(env, 0) #fully greedy (Q-learning)
+    explorer = TabularQExplorer(target.q) #default explorer with shared Q
+    TabularExpectedSARSA(target, explorer; kwargs...)
+end
+
+Random.seed!(agent::TabularExpectedSARSA, v::Integer) = seed!(agent.explorer, v)
+
+(agent::TabularExpectedSARSA)(stage::PreExperiment, env::AbstractTabularEnv) = agent.explorer(stage, env)
+
+function (agent::TabularExpectedSARSA)(stage::PreEpisode, env::AbstractTabularEnv)
+    agent.s0 = RLBase.state(env, IntegerState())
+    agent.a0 = get_action(agent.explorer, agent.s0)
+    agent.explorer(stage, env)
+end
+
+(agent::TabularExpectedSARSA)(stage::PreAction, env::AbstractTabularEnv) = agent.explorer(stage, env)
+
+#the action to apply is the one computed and stored on the previous PostAction
+#update
+get_action(agent::TabularExpectedSARSA, ::Any) = agent.a0
+
+function (agent::TabularExpectedSARSA{NS, NA, R})(stage::PostAction, env::AbstractTabularEnv{NS, NA}) where {NS, NA, R}
+    @unpack target, α, γ, s0, a0 = agent
+    q = target.q.data #the Q to update is that of the target policy (may or may not be the one used by the explorer)
+
+    r1 = RLBase.reward(env)
+    s1 = RLBase.state(env, IntegerState())
+    a1 = get_action(agent.explorer, s1)
+
+    #expected value of state s1 under the target policy
+    v1 = get_value(target, s1)
+
+    q[s0, a0] += α * (r1 + γ * v1 - q[s0, a0])
+
+    agent.s0 = s1
+    agent.a0 = a1
+
+    agent.explorer(stage, env) #updates the explorer's step
+end
+
+function run_steps(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
+    for _ in 1:n
+        agent(PreAction(), env)
+        action = get_action(agent, env)
+        step!(env, action)
+        agent(PostAction(), env)
+    end
 end
 
 function run_episodes(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
@@ -430,41 +545,27 @@ function run_episodes(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
         RLBase.reset!(env)
         agent(PreEpisode(), env)
         while !RLBase.is_terminated(env)
-            agent(PreAction(), env)
-            action = get_action(agent, env)
-            step!(env, action)
-            agent(PostAction(), env)
+            run_steps(env, agent, 1)
         end
     end
 end
 
-#next: off policy: Q learning and Expected Sarsa
+#el constructor recibira una sola target. Pero la duplicara con deepcopy o
+#similar y guardara ambas en targetA y targetB.
 
-# #define a stop condition: the best action is no longer changing for any state
+# double expected SARSA needs two separate targets
+# q_A = target_A.q.data
+# q_B = target_B.q.data
 
-# function test_SARSA()
-#     #with γ = 1, the agent does not really learn to solve the SRU environment,
-#     #because without discounting the reward it gets at the end of the episode is
-#     #the same whether it takes the minimum number of steps or infinitely many to
-#     #get there
-#     #see how this works in terms of q values
+# if step is even
+#     v1_A = get_value(target_A, s1)
+#     q_B[s0, a0] += α * (r1 + γ * v1_A - q_B[s0, a0])
+# else
+#     v1_B = get_value(target_B, s1)
+#     q_A[s0, a0] += α * (r1 + γ * v1_B - q_A[s0, a0])
 # end
 
-
-# # struct ExpectedSarsa <: RLBase.AbstractPolicy
-# # end
-# #ver video DeepMind
-
-# #NO. Lo que tenemos que hacer es, dentro del agente, definir una QTable, y
-# #despues construir una EpsGreedy que use esa QTable como source.
-
-# #Porque el siguiente paso es desarrollar un agente que haga Q Learning, y para
-# #eso necesitara almacenar dos policies, una target y una behavior. Pero en
-# #general ambas podrian compartir la misma QTable. No, a ver. El que la
-# #EpsGreedyPolicy contenga una QTable no significa necesariamente que sea
-# #propietaria de ella. Puede tener una referencia a una QTable compartida con
-# #otra policy. Pero eso no significa que la EpsGreedy no deba tener un campo q.
-# #Debe tenerlo.
+# agent.explorer.policy.q .= 0.5 * (q_A + q_B)
 
 # #Si hacemos double Q learning, necesitaremos 2 QTables. Pero necesitamos tambien
 # #2 policies? No. Es más, cuando hacemos Q learning, la target QTable no necesita
@@ -474,14 +575,6 @@ end
 # #En general, para off-policy learning sí que necesitaremos una target Policy,
 # #porque a la hora de ponderar las observaciones necesitamos probabilidades tanto
 # #de la target como de la behavior, asi que la target no puede
-
-# #podemos definir una <:AbstractPolicy que a su vez contenga otras dos
-# #AbstractPolicies, aunque realmente eso empieza a parecerse mas a un Agent
-
-# #el agente contiene la policy o la policy el agente? segun el enfoque de
-# #ReinforcementLearning.jl, es lo segundo. una policy en general puede ser
-# #stateful. puede contener a su vez dos policies e ir modificandolas
-
 
 # # ############################### Environment ####################################
 
