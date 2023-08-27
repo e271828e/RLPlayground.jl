@@ -356,6 +356,25 @@ struct PreEpisode <: AbstractStage end
 struct PreAction <: AbstractStage end
 struct PostAction <: AbstractStage end
 
+function run_steps(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
+    for _ in 1:n
+        agent(PreAction(), env)
+        action = get_action(agent, env)
+        step!(env, action)
+        agent(PostAction(), env)
+    end
+end
+
+function run_episodes(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
+    for _ in 1:n
+        RLBase.reset!(env)
+        agent(PreEpisode(), env)
+        while !RLBase.is_terminated(env)
+            run_steps(env, agent, 1)
+        end
+    end
+end
+
 ############################## TabularQExplorer ################################
 
 mutable struct TabularQExplorer{NS, NA, R <: AbstractRNG} <: AbstractAgent
@@ -492,7 +511,7 @@ end
 
 function TabularExpectedSARSA(env::AbstractTabularEnv; kwargs...)
     target = EpsGreedyPolicy(env, 0) #fully greedy (Q-learning)
-    explorer = TabularQExplorer(target.q) #default explorer with shared Q
+    explorer = TabularQExplorer(target.q) #default explorer shares its Q with the target policy
     TabularExpectedSARSA(target, explorer; kwargs...)
 end
 
@@ -531,50 +550,94 @@ function (agent::TabularExpectedSARSA{NS, NA, R})(stage::PostAction, env::Abstra
     agent.explorer(stage, env) #updates the explorer's step
 end
 
-function run_steps(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
-    for _ in 1:n
-        agent(PreAction(), env)
-        action = get_action(agent, env)
-        step!(env, action)
-        agent(PostAction(), env)
+
+function test_TabularExpectedSARSA()
+    gw = GridWorld(; H = 5, W = 7)
+    agent = TabularExpectedSARSA(gw)
+    run_episodes(gw, agent, 200)
+    display(reshape(TabularV(agent.target.q, agent.target).data, 5, 7))
+    return gw, agent
+end
+
+
+########################### TabularDoubleExpectedSARSA #########################
+
+mutable struct TabularDoubleExpectedSARSA{NS, NA, R <: AbstractRNG} <: AbstractAgent
+    const target_A::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
+    const target_B::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
+    const target::EpsGreedyPolicy{NA, TabularQ{NS, NA}}
+    const explorer::TabularQExplorer{NS, NA, R}
+    const γ::Float64
+    const α::Float64
+    s0::Int
+    a0::Int
+    function TabularDoubleExpectedSARSA(target::EpsGreedyPolicy{NA, TabularQ{NS, NA}},
+                                  explorer::TabularQExplorer{NS, NA, R};
+                                  γ::Real = 0.9, α::Real = 0.8) where {NS, NA, R}
+        @assert 0 <= γ <= 1
+        @assert 0 < α < 1
+        target_A = deepcopy(target)
+        target_B = deepcopy(target)
+        new{NS, NA, R}(target_A, target_B, target, explorer, γ, α, 0, 0)
     end
 end
 
-function run_episodes(env::RLBase.AbstractEnv, agent::AbstractAgent, n = 1)
-    for _ in 1:n
-        RLBase.reset!(env)
-        agent(PreEpisode(), env)
-        while !RLBase.is_terminated(env)
-            run_steps(env, agent, 1)
-        end
-    end
+function TabularDoubleExpectedSARSA(env::AbstractTabularEnv; kwargs...)
+    target = EpsGreedyPolicy(env, 0) #fully greedy (Q-learning)
+    explorer = TabularQExplorer(target.q) #default explorer uses the Q from the target
+    TabularDoubleExpectedSARSA(target, explorer; kwargs...)
 end
 
-#el constructor recibira una sola target. Pero la duplicara con deepcopy o
-#similar y guardara ambas en targetA y targetB.
+Random.seed!(agent::TabularDoubleExpectedSARSA, v::Integer) = seed!(agent.explorer, v)
 
-# double expected SARSA needs two separate targets
-# q_A = target_A.q.data
-# q_B = target_B.q.data
+(agent::TabularDoubleExpectedSARSA)(stage::PreExperiment, env::AbstractTabularEnv) = agent.explorer(stage, env)
 
-# if step is even
-#     v1_A = get_value(target_A, s1)
-#     q_B[s0, a0] += α * (r1 + γ * v1_A - q_B[s0, a0])
-# else
-#     v1_B = get_value(target_B, s1)
-#     q_A[s0, a0] += α * (r1 + γ * v1_B - q_A[s0, a0])
-# end
+function (agent::TabularDoubleExpectedSARSA)(stage::PreEpisode, env::AbstractTabularEnv)
+    agent.s0 = RLBase.state(env, IntegerState())
+    agent.a0 = get_action(agent.explorer, agent.s0)
+    agent.explorer(stage, env)
+end
 
-# agent.explorer.policy.q .= 0.5 * (q_A + q_B)
+(agent::TabularDoubleExpectedSARSA)(stage::PreAction, env::AbstractTabularEnv) = agent.explorer(stage, env)
 
-# #Si hacemos double Q learning, necesitaremos 2 QTables. Pero necesitamos tambien
-# #2 policies? No. Es más, cuando hacemos Q learning, la target QTable no necesita
-# #estar embebida en una policy, porque no vamos a seguirla ni a necesitar obtener
-# #probabilidades, solo su valor maximo.
+#the action to apply is the one computed and stored on the previous PostAction
+#update
+get_action(agent::TabularDoubleExpectedSARSA, ::Any) = agent.a0
 
-# #En general, para off-policy learning sí que necesitaremos una target Policy,
-# #porque a la hora de ponderar las observaciones necesitamos probabilidades tanto
-# #de la target como de la behavior, asi que la target no puede
+function (agent::TabularDoubleExpectedSARSA{NS, NA, R})(stage::PostAction, env::AbstractTabularEnv{NS, NA}) where {NS, NA, R}
+    @unpack target, target_A, target_B, explorer, α, γ, s0, a0 = agent
+    q_A = target_A.q.data
+    q_B = target_B.q.data
+    q = target.q.data
+
+    r1 = RLBase.reward(env)
+    s1 = RLBase.state(env, IntegerState())
+    a1 = get_action(agent.explorer, s1)
+
+    if mod(explorer.step, 2) |> Bool #odd step, we update B
+        v1_A = get_value(target_A, s1)
+        q_B[s0, a0] += α * (r1 + γ * v1_A - q_B[s0, a0])
+    else #even step, we update A
+        v1_B = get_value(target_B, s1)
+        q_A[s0, a0] += α * (r1 + γ * v1_B - q_A[s0, a0])
+    end
+
+    #update average prediction (used by the explorer)
+    q .= 0.5 .* (q_A .+ q_B)
+
+    agent.s0 = s1
+    agent.a0 = a1
+
+    agent.explorer(stage, env) #updates the explorer's step
+end
+
+function test_TabularDoubleExpectedSARSA()
+    gw = GridWorld(; H = 5, W = 7)
+    agent = TabularDoubleExpectedSARSA(gw)
+    run_episodes(gw, agent, 200)
+    display(reshape(TabularV(agent.target.q, agent.target).data, 5, 7))
+    return gw, agent
+end
 
 # # ############################### Environment ####################################
 
